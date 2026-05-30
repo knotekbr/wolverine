@@ -214,7 +214,7 @@ internal sealed class ApiVersioningPolicy : IHttpPolicy
     /// <summary>Step E — prepend the URL-segment version prefix to every versioned chain.</summary>
     private void RewriteRoutes(IReadOnlyList<HttpChain> chains)
     {
-        if (_options.UrlSegmentPrefix is null)
+        if (_options.UsesNonUrlReader || _options.UrlSegmentPrefix is null)
             return;
 
         ValidateUrlSegmentPrefix(chains);
@@ -361,6 +361,12 @@ internal sealed class ApiVersioningPolicy : IHttpPolicy
                 advertisedVersions: Array.Empty<ApiVersion>(),
                 deprecatedAdvertisedVersions: Array.Empty<ApiVersion>());
             chain.Metadata.WithMetadata(new ApiVersionMetadata(model, model));
+
+            if (_options.UsesNonUrlReader)
+            {
+                var versionString = chain.ApiVersion.ToString();
+                chain.Metadata.WithMetadata(new WolverineApiVersionMatchMetadata(versionString));
+            }
 
             // Make the OperationId (already unique per handler type + method) the explicit
             // endpoint name. Without this, ASP.NET Core uses ToString() which is derived from

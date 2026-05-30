@@ -191,6 +191,15 @@ public static class WolverineHttpEndpointRouteBuilderExtensions
             return new ApiVersionHeaderWriter(versioningOptions);
         });
 
+        // Registered unconditionally - policy automatically short-circuits unless non-URL versioning
+        // is configured.
+        services.AddSingleton<MatcherPolicy>(sp =>
+        {
+            var httpOptions = sp.GetRequiredService<WolverineHttpOptions>();
+            var headerWriter = sp.GetRequiredService<ApiVersionHeaderWriter>();
+            return new ApiVersionEndpointSelectorPolicy(httpOptions.ApiVersioning, headerWriter);
+        });
+
         services.ConfigureWolverine(opts =>
         {
             opts.CodeGeneration.Sources.Add(new NullableHttpContextSource());
