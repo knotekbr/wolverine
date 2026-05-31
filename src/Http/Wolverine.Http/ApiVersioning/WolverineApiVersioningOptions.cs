@@ -75,7 +75,7 @@ public sealed class WolverineApiVersioningOptions
     /// requests. URL segment versioning is used by default when this list is empty, and is disabled
     /// if any readers are manually added.
     /// </summary>
-    public List<WolverineApiVersionReader> VersionReaders { get; set; } = [];
+    public List<WolverineApiVersionReader> VersionReaders { get; } = [];
 
     /// <summary>
     /// Use the version specified by <see cref="DefaultVersion"/> when handling requests that don't

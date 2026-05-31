@@ -44,7 +44,7 @@ internal static class UnsupportedVersionEndpointFactory
                 await HttpHandler.WriteProblems(problemDetails, ctx).ConfigureAwait(false);
             },
             metadata,
-            $"Wolverine: Unsupported API Version '{requestedVersion ?? "(unspecified)"}')"
+            $"Wolverine: Unsupported API Version '{requestedVersion ?? "(unspecified)"}'"
         );
     }
 }
