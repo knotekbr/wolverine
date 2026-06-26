@@ -15,7 +15,26 @@ public interface IListenerCircuit
     Endpoint Endpoint { get; }
     int QueueCount { get; }
     ValueTask PauseAsync(TimeSpan pauseTime);
+    
+    /// <summary>
+    /// Pause the listener and fully drain any buffered messages before returning.
+    /// Unlike PauseAsync (which may skip the drain to avoid deadlocks when called from
+    /// within the handler pipeline), this method guarantees all queued messages are
+    /// processed before returning. Safe to call from background threads.
+    /// </summary>
+    ValueTask PauseWithDrainAsync(TimeSpan pauseTime);
+    
     ValueTask StartAsync();
+
+    /// <summary>
+    /// Force the listener to stop and rebuild its underlying transport listener even if it currently reports
+    /// <see cref="ListeningStatus.Accepting"/>. This is the remediation primitive for recovering a "stuck"
+    /// listener — e.g. a dead transport channel that the framework could not self-heal but that still reports
+    /// Accepting — without bouncing the process. When <paramref name="force"/> is <c>false</c> this behaves like
+    /// <see cref="StartAsync"/> (a no-op when already Accepting). The default implementation is the gentle
+    /// <see cref="StartAsync"/>; circuits backed by a real transport listener override it to tear down and rebuild.
+    /// </summary>
+    ValueTask RestartAsync(bool force = true) => StartAsync();
 
     Task EnqueueDirectlyAsync(IEnumerable<Envelope> envelopes);
 }
@@ -48,6 +67,7 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
     private IDisposable? _restarter;
     private int _lastObservedQueueCount;
     private DateTimeOffset _lastQueueCountChangeAt = DateTimeOffset.UtcNow;
+    private bool _disposed;
 
     public ListeningAgent(Endpoint endpoint, WolverineRuntime runtime)
     {
@@ -85,6 +105,10 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
 
     public async ValueTask DisposeAsync()
     {
+        if (_disposed)
+            return;
+        _disposed = true;
+
         _restarter?.SafeDispose();
         _backPressureAgent?.SafeDispose();
 
@@ -106,6 +130,10 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
 
     public void Dispose()
     {
+        if (_disposed)
+            return;
+        _disposed = true;
+
         _receiver?.Dispose();
         _circuitBreaker?.SafeDisposeSynchronously();
         _backPressureAgent?.SafeDispose();
@@ -284,6 +312,20 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
         await _runtime.Observer.ListenerLatched(Endpoint);
     }
 
+    public async ValueTask RestartAsync(bool force = true)
+    {
+        if (force)
+        {
+            // Tear the listener down even when Status still reports Accepting — the underlying transport channel
+            // may be dead while the orchestration status is stale (the #3171-class state, or anything the framework
+            // can't self-heal). StopAndDrainAsync sets Status to Stopped, so the StartAsync() below is no longer a
+            // no-op and fully rebuilds the listener.
+            await StopAndDrainAsync();
+        }
+
+        await StartAsync();
+    }
+
     public async ValueTask StartAsync()
     {
         if (Status == ListeningStatus.Accepting)
@@ -345,13 +387,25 @@ public class ListeningAgent : IAsyncDisposable, IDisposable, IListeningAgent
 
     public async ValueTask PauseAsync(TimeSpan pauseTime)
     {
+        // Do NOT pre-latch the receiver here. PauseAsync may be called from within the
+        // handler pipeline (e.g. via RateLimitContinuation → PauseListenerContinuation).
+        // Pre-latching causes DrainAsync to wait for the ActionBlock to drain, which
+        // deadlocks because the current message's execute frame is still on the call stack.
+        await PauseCoreAsync(pauseTime, latchBeforeDrain: false);
+    }
+
+    public async ValueTask PauseWithDrainAsync(TimeSpan pauseTime)
+    {
+        // Safe to fully drain here: this method is called from background threads
+        // (circuit breaker), never from within the handler pipeline call stack.
+        await PauseCoreAsync(pauseTime, latchBeforeDrain: true);
+    }
+
+    private async ValueTask PauseCoreAsync(TimeSpan pauseTime, bool latchBeforeDrain)
+    {
         try
         {
-            // Do NOT pre-latch the receiver here. PauseAsync may be called from within the
-            // handler pipeline (e.g. via RateLimitContinuation → PauseListenerContinuation).
-            // Pre-latching causes DrainAsync to wait for the ActionBlock to drain, which
-            // deadlocks because the current message's execute frame is still on the call stack.
-            await StopAndDrainCoreAsync(latchBeforeDrain: false);
+            await StopAndDrainCoreAsync(latchBeforeDrain);
         }
         catch (Exception e)
         {

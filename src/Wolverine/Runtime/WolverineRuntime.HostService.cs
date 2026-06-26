@@ -98,6 +98,15 @@ public partial class WolverineRuntime
             // Build up the message handlers
             Handlers.Compile(Options, _container);
 
+            // Under MultipleHandlerBehavior.Separated, a message type may have BOTH a direct
+            // Handle(T) handler AND a BatchMessagesOf<T>() batch handler. By default the batch
+            // local queue is the element type's convention queue — the SAME queue the direct
+            // handler uses — so the two collide (a local queue resolves a single executor per
+            // message type) and the batch is silently shadowed. Move the batch onto a dedicated
+            // queue so both can run independently. Done before the messaging transports start so
+            // the new queue still receives the durable/local-queue endpoint policies.
+            reassignBatchQueuesThatCollideWithHandlers();
+
             // Pre-populate the message-type-name cache so the per-message ToMessageTypeName()
             // hot path inside Envelope construction never pays the first-occurrence reflection
             // cost (attribute reads, interface walks, generic-type pretty-printing).
@@ -235,7 +244,17 @@ public partial class WolverineRuntime
         
         if (Options.AutoBuildMessageStorageOnStartup != AutoCreate.None && Storage is not NullMessageStore)
         {
-            await _stores.Value.MigrateAsync();
+            try
+            {
+                await _stores.Value.MigrateAsync();
+            }
+            catch (Exception e) when (Options.ResourceMigrationFailureMode == ResourceMigrationFailureMode.ContinueOnFailures)
+            {
+                // e.g. a replica that lost the migration lock during a rolling deploy. Log and keep
+                // starting up rather than crash-looping. See GH-3130.
+                Logger.LogError(e,
+                    "Failed to migrate Wolverine message storage on startup. Continuing startup anyway because ResourceMigrationFailureMode is ContinueOnFailures.");
+            }
         }
 
         _hasMigratedStorage = true;
@@ -457,11 +476,24 @@ public partial class WolverineRuntime
             Options.Transports.RemoveLocal();
         }
 
+        var failedTransports = new List<ITransport>();
         foreach (var transport in Options.Transports)
         {
             if (!Options.ExternalTransportsAreStubbed)
             {
-                await transport.InitializeAsync(this).ConfigureAwait(false);
+                try
+                {
+                    await transport.InitializeAsync(this).ConfigureAwait(false);
+                }
+                catch (Exception e) when (Options.ResourceMigrationFailureMode == ResourceMigrationFailureMode.ContinueOnFailures)
+                {
+                    // e.g. a transient broker-provisioning failure during a rolling deploy. Log, skip this
+                    // transport's endpoint startup below, and keep the application starting. See GH-3130.
+                    failedTransports.Add(transport);
+                    Logger.LogError(e,
+                        "Failed to initialize Wolverine transport {Transport} on startup. Continuing startup anyway because ResourceMigrationFailureMode is ContinueOnFailures.",
+                        transport);
+                }
             }
             else
             {
@@ -471,6 +503,9 @@ public partial class WolverineRuntime
 
         foreach (var transport in Options.Transports)
         {
+            // A transport that failed to initialize under ContinueOnFailures has no usable endpoints
+            if (failedTransports.Contains(transport)) continue;
+
             var replyUri = transport.ReplyEndpoint()?.Uri;
 
             foreach (var endpoint in transport.Endpoints().Where(x => x.AutoStartSendingAgent()))
@@ -519,6 +554,49 @@ public partial class WolverineRuntime
             {
                 Logger.LogError(e, "Error cleaning up idle sending agents");
             }
+        }
+    }
+
+    // Suffix appended to the element type's convention queue name to host the batch processor
+    // when the same element type also has a direct handler under Separated mode.
+    internal const string BatchQueueSuffix = "-batch";
+
+    private void reassignBatchQueuesThatCollideWithHandlers()
+    {
+        if (Options.MultipleHandlerBehavior != MultipleHandlerBehavior.Separated)
+        {
+            return;
+        }
+
+        if (Options.BatchDefinitions.Count == 0)
+        {
+            return;
+        }
+
+        var local = Options.Transports.GetOrCreate<LocalTransport>();
+
+        foreach (var batch in Options.BatchDefinitions)
+        {
+            // No direct Handle(T) handler for the element type -> the batch owns the element
+            // type's queue and the existing fallback routing/executor behavior is correct.
+            if (Handlers.ChainFor(batch.ElementType) == null)
+            {
+                continue;
+            }
+
+            // The user explicitly pointed the batch at a distinct queue already -> respect it.
+            var directQueue = local.FindQueueForMessageType(batch.ElementType);
+            if (!string.Equals(batch.LocalExecutionQueueName, directQueue.EndpointName,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            // Move the batch onto a dedicated queue distinct from the direct handler's queue.
+            var batchQueueName = directQueue.EndpointName + BatchQueueSuffix;
+            var batchQueue = local.QueueFor(batchQueueName);
+            batchQueue.Mode = directQueue.Mode;
+            batch.LocalExecutionQueueName = batchQueue.EndpointName;
         }
     }
 

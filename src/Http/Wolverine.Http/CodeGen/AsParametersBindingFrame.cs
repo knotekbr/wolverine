@@ -35,7 +35,9 @@ internal class AsParamatersAttributeUsage : IParameterStrategy
             chain.RequestType = parameter.ParameterType;
             chain.AsParametersType = parameter.ParameterType;
             chain.IsFormData = true;
-            variable = new AsParametersBindingFrame(parameter.ParameterType, chain, container).Variable;
+            var bindingFrame = new AsParametersBindingFrame(parameter.ParameterType, chain, container);
+            chain.AsParametersVariable = bindingFrame.Variable;
+            variable = bindingFrame.Variable;
             return true;
         }
 
@@ -88,6 +90,7 @@ internal class AsParametersBindingFrame : SyncFrame
     
     private bool _hasForms = false;
     private bool _hasJsonBody = false;
+    private int _jsonBodyCount = 0;
 
     public AsParametersBindingFrame([DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.PublicProperties)] Type queryType, HttpChain chain, IServiceContainer container)
     {
@@ -133,6 +136,16 @@ internal class AsParametersBindingFrame : SyncFrame
         {
             throw new InvalidOperationException(
                 $"{queryType.FullNameInCode()} cannot be decorated with [AsParameters] because it uses both [FromForm] and [FromBody] binding. You can only use one or the other option");
+        }
+
+        // The request body is read once (chain.RequestBodyVariable is single-shot), so a second
+        // [FromBody] member would silently reuse the first member's deserialization variable and
+        // produce a wrong-typed assignment. Fail fast with a clear message, mirroring the
+        // FromForm+FromBody guard above. ASP.NET likewise rejects more than one body. See GH-3135.
+        if (_jsonBodyCount > 1)
+        {
+            throw new InvalidOperationException(
+                $"{queryType.FullNameInCode()} cannot be decorated with [AsParameters] because it has more than one [FromBody] member. Only a single request body is supported");
         }
     }
     
@@ -181,9 +194,13 @@ internal class AsParametersBindingFrame : SyncFrame
         if (parameter.TryGetAttribute<FromBodyAttribute>(out var batt))
         {
             _hasJsonBody = true;
+            _jsonBodyCount++;
             chain.RequestType = memberType;
+            // A nullable [FromBody] member is an optional body: an empty request body binds null at
+            // runtime (instead of 400) and renders requestBody.required = false. See GH-3135.
+            chain.RequestBodyIsOptional = IsNullableMember(parameter);
             variable = chain.BuildJsonDeserializationVariable();
-            
+
             chain.IsFormData = false;
             return true;
         }
@@ -242,9 +259,13 @@ internal class AsParametersBindingFrame : SyncFrame
         if (propertyInfo.TryGetAttribute<FromBodyAttribute>(out var batt))
         {
             _hasJsonBody = true;
+            _jsonBodyCount++;
             chain.RequestType = memberType;
+            // A nullable [FromBody] member is an optional body: an empty request body binds null at
+            // runtime (instead of 400) and renders requestBody.required = false. See GH-3135.
+            chain.RequestBodyIsOptional = IsNullableMember(propertyInfo);
             variable = chain.BuildJsonDeserializationVariable();
-            
+
             chain.IsFormData = false;
             return true;
         }
@@ -281,5 +302,28 @@ internal class AsParametersBindingFrame : SyncFrame
     public override IEnumerable<Variable> FindVariables(IMethodVariables chain)
     {
         foreach (var parameter in _dependencies) yield return parameter;
+    }
+
+    // A member is nullable when it's a Nullable<T> value type or a reference type whose nullable
+    // annotation context marks it nullable. A fresh NullabilityInfoContext per call keeps this
+    // thread-safe across concurrent chain compilation.
+    private static bool IsNullableMember(ParameterInfo parameter)
+    {
+        if (parameter.ParameterType.IsValueType)
+        {
+            return parameter.ParameterType.IsNullable();
+        }
+
+        return new NullabilityInfoContext().Create(parameter).WriteState == NullabilityState.Nullable;
+    }
+
+    private static bool IsNullableMember(PropertyInfo property)
+    {
+        if (property.PropertyType.IsValueType)
+        {
+            return property.PropertyType.IsNullable();
+        }
+
+        return new NullabilityInfoContext().Create(property).WriteState == NullabilityState.Nullable;
     }
 }

@@ -100,6 +100,18 @@ Valid handler method names: `Handle`, `HandleAsync`, `Consume`, `ConsumeAsync` (
 
 Handlers are discovered by scanning assemblies. Use attributes like `[WolverineHandler]`, `[WolverineMessage]`, `[WolverineIgnore]` to control discovery.
 
+## Naming conventions
+
+Member casing is driven by **accessibility**, not by member kind:
+
+- **`internal` and `public` members** (methods, properties, events, constants) use **PascalCase**.
+- **`private` and `protected` members** (methods, properties) use **camelCase** — e.g. `buildSenderIfMissing()`,
+  `writeOutgoingHeader()`, `tableExistsAsync()`. This includes `private static` helper methods.
+- Private/protected **fields** keep the conventional leading underscore + camelCase (`_sender`, `_queueTable`).
+
+When in doubt, match the surrounding file. Examples: `EnvelopeMapper` (`buildIncoming`/`buildOutgoing` private vs
+`MapProperty`/`ReceivesMessage` public), `SqlServerQueue` (`buildSenderIfMissing` private vs `SendAsync` public).
+
 ## Performance conventions
 
 ### Use `ImHashMap` for hot-path dictionary lookups
@@ -134,6 +146,15 @@ var bus = host.Services.GetRequiredService<IMessageBus>();
 // scoped bus already attached to the current message context
 var bus = host.MessageBus();
 ```
+
+### Database connection strings come from `Servers`
+
+Always obtain database connection strings from the `Servers` type (`src/Servers.cs`,
+e.g. `Servers.PostgresConnectionString`, `Servers.SqlServerConnectionString`). **Never
+hardcode a connection string literal in a test.** This keeps host/port/credentials
+centralized and CI-portable — e.g. Wolverine's own docker-compose Postgres runs on port
+**5433** (`docker compose up -d postgresql`), distinct from Marten's `5432`, and only
+`Servers` knows that.
 
 ## Configuration Organization
 

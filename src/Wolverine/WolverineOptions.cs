@@ -132,6 +132,25 @@ public class MetricsOptions
     /// Wolverine will sample and publish metric data collection. Default is 5 seconds
     /// </summary>
     public TimeSpan SamplingPeriod { get; set; } = 5.Seconds();
+
+    /// <summary>
+    /// Default explicit histogram bucket boundaries (in milliseconds) applied to the
+    /// <c>wolverine-execution-time</c> and <c>wolverine-effective-time</c> histograms. The
+    /// OpenTelemetry SDK's default buckets are poor for millisecond-scale latencies; these are tuned for
+    /// message handling. See GH-3224.
+    /// </summary>
+    public static readonly IReadOnlyList<double> DefaultHistogramBucketBoundaries =
+        new double[] { 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000 };
+
+    /// <summary>
+    /// Explicit histogram bucket boundaries (in milliseconds) used as the instrument <em>advice</em> for
+    /// the <c>wolverine-execution-time</c> and <c>wolverine-effective-time</c> histograms, so quantile
+    /// baselines computed from a time-series database (Prometheus / VictoriaMetrics) are meaningful for
+    /// millisecond latencies. Defaults to <see cref="DefaultHistogramBucketBoundaries"/>. Set to
+    /// <c>null</c> to fall back to the OpenTelemetry SDK / exporter defaults, or supply your own ascending
+    /// boundaries. An OpenTelemetry <c>View</c> still overrides this advice when configured. See GH-3224.
+    /// </summary>
+    public IReadOnlyList<double>? HistogramBucketBoundaries { get; set; } = DefaultHistogramBucketBoundaries;
 }
 
 /// <summary>
@@ -151,6 +170,16 @@ public class TrackingOptions
     /// automatically.
     /// </summary>
     public bool EnableMessageCausationTracking { get; set; }
+
+    /// <summary>
+    /// When enabled, the Wolverine event-store integrations (Wolverine.Marten / Wolverine.Polecat)
+    /// report events appended during an outbox-enrolled message/endpoint execution to
+    /// <c>IWolverineObserver.EventsAppended</c>, so the executing-handler→appended-event-type
+    /// relationship (invisible to message causation, since appended events never hit the outbox)
+    /// can be reconstructed. Default is <c>false</c>; <c>Wolverine.CritterWatch</c> enables this
+    /// automatically.
+    /// </summary>
+    public bool EnableEventAppendTracking { get; set; }
 
     /// <summary>
     /// When enabled, Wolverine emits structured diagnostics around each handler
@@ -232,6 +261,11 @@ public sealed partial class WolverineOptions
         Policies.Add<SideEffectPolicy>();
         Policies.Add<ResponsePolicy>();
         Policies.Add<OutgoingMessagesPolicy>();
+
+        // Phase-A pre-population of IChain.AncillaryStoreType for [Storage]-attributed handlers so the
+        // ancillary-store inbox routing map sees them eagerly at startup. Mirrors the per-provider
+        // eager policies (e.g. Marten's MartenStoreEagerPolicy). See StorageAttributeEagerPolicy.
+        Policies.Add<StorageAttributeEagerPolicy>();
 
         this.OnException<DuplicateIncomingEnvelopeException>().Discard();
 
@@ -483,10 +517,36 @@ public sealed partial class WolverineOptions
         set => _autoBuildMessageStorageOnStartup = value;
     }
 
+    private ResourceMigrationFailureMode? _resourceMigrationFailureMode;
+
+    /// <summary>
+    ///     Controls what happens when Wolverine's own startup work — message store migration and
+    ///     messaging transport initialization / auto-provisioning — fails. Defaults (when not set here)
+    ///     to the active JasperFx profile's value, i.e. <see cref="ResourceMigrationFailureMode.FailFast"/>
+    ///     (abort startup). Set to <see cref="ResourceMigrationFailureMode.ContinueOnFailures"/> — typically
+    ///     only on the <c>Production</c> profile via <c>JasperFxOptions.Production.ResourceMigrationFailureMode</c> —
+    ///     so that, e.g., a replica that loses the migration lock during a rolling deploy logs the failure
+    ///     and continues starting up instead of crash-looping. Mirrors JasperFx's resource-setup hosted
+    ///     service for resources outside that service's reach (GH-3130). An explicit value set here wins
+    ///     over the profile.
+    /// </summary>
+    public ResourceMigrationFailureMode ResourceMigrationFailureMode
+    {
+        get => _resourceMigrationFailureMode ?? ResourceMigrationFailureMode.FailFast;
+        set => _resourceMigrationFailureMode = value;
+    }
+
     /// <summary>
     ///     Descriptive name of the running service. Used in Wolverine diagnostics and testing support
     /// </summary>
     public string ServiceName { get; set; } = null!;
+
+    /// <summary>
+    ///     Free-form, user-defined service-level tags. These are surfaced on <c>ServiceCapabilities.Tags</c> and flow
+    ///     to monitoring tools (e.g. CritterWatch) so operators can label and filter related services by their own
+    ///     conventions. The operator owns any <c>key:value</c> convention — Wolverine treats these as opaque strings.
+    /// </summary>
+    public IList<string> Tags { get; } = new List<string>();
 
     /// <summary>
     ///     This should probably *only* be used in development or testing
@@ -653,6 +713,11 @@ public sealed partial class WolverineOptions
         if (_autoBuildMessageStorageOnStartup == null)
         {
             _autoBuildMessageStorageOnStartup = jasperfx.ActiveProfile.ResourceAutoCreate;
+        }
+
+        if (_resourceMigrationFailureMode == null)
+        {
+            _resourceMigrationFailureMode = jasperfx.ActiveProfile.ResourceMigrationFailureMode;
         }
 
         // Propagate GeneratedCodeOutputPath from JasperFxOptions if not explicitly set

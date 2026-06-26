@@ -43,10 +43,10 @@ public class KafkaTopicGroup : KafkaTopic, IBrokerEndpoint
 
         var config = GetEffectiveConsumerConfig();
 
-        if (Mode == EndpointMode.Durable)
-        {
-            config.EnableAutoCommit = false;
-        }
+        ApplyHotTailConfig(config, runtime);
+
+        // Wire the Kafka client for the configured commit strategy (GH-3150).
+        KafkaOffsetCommitter.ApplyTo(config, CommitMode);
 
         var listener = new KafkaTopicGroupListener(this, config,
             Parent.CreateConsumer(config), receiver, runtime.LoggerFactory.CreateLogger<KafkaTopicGroupListener>());
@@ -100,6 +100,8 @@ public class KafkaTopicGroup : KafkaTopic, IBrokerEndpoint
 
     new public async ValueTask TeardownAsync(ILogger logger)
     {
+        if (IsExternallyOwned) return;
+
         using var adminClient = Parent.CreateAdminClient();
         await adminClient.DeleteTopicsAsync(TopicNames);
     }
@@ -118,6 +120,8 @@ public class KafkaTopicGroup : KafkaTopic, IBrokerEndpoint
 
     new public async ValueTask SetupAsync(ILogger logger)
     {
+        if (IsExternallyOwned) return;
+
         using var adminClient = Parent.CreateAdminClient();
 
         foreach (var topicName in TopicNames)
@@ -152,11 +156,14 @@ public class KafkaTopicGroup : KafkaTopic, IBrokerEndpoint
     /// consumer raises "Subscribed topic not available" on the first Consume().
     /// Overrides the base KafkaTopic.InitializeAsync so the group's multi-topic
     /// SetupAsync is invoked (not the single-topic base version).
+    /// Groups marked <see cref="KafkaTopic.IsExternallyOwned"/> are skipped so
+    /// externally-managed topics don't fail startup when the calling identity
+    /// lacks CreateTopics ACLs.
     /// See https://github.com/JasperFx/wolverine/issues/2537.
     /// </summary>
     public override async ValueTask InitializeAsync(ILogger logger)
     {
-        if (Parent.AutoProvision)
+        if (Parent.AutoProvision && !IsExternallyOwned)
         {
             await SetupAsync(logger);
         }

@@ -328,6 +328,37 @@ public static class MarkItemEndpoint
     
     [WolverineGet("/orders/latest/from-query")]
     public static Order GetLatestFromQuery([FromQuery] Guid id, [ReadAggregate] Order order) => order;
+
+    // Repro for the [AsParameters] + [ReadAggregate] + route-id combination (codegen infinite loop)
+    [WolverineGet("/orders/latest/asparameters/{id}")]
+    public static Order GetLatestViaAsParameters(
+        [Microsoft.AspNetCore.Http.AsParameters] GetLatestOrderQuery query,
+        [ReadAggregate] Order order) => order;
+}
+
+public record GetLatestOrderQuery([FromRoute] Guid Id);
+
+// GH-3135 repro: an [AsParameters] object carries the conventional aggregate-id route value
+// ({orderId}) AND a [FromBody] payload, while [WriteAggregate] IEventStream<Order> resolves the
+// stream from that same id. Mirrors uniquelau's
+//   (Response, IEventStream<Journey>) Handle([AsParameters] cmd, [WriteAggregate] IEventStream<Journey>)
+// where cmd = ([FromRoute] Guid JourneyId, [FromBody] Payload) — the shape that reportedly 500s.
+public record ShipOrderPayload(string Carrier);
+
+public record ShipOrderViaAsParameters([FromRoute] Guid OrderId, [FromBody] ShipOrderPayload Body);
+
+public record OrderShipmentResponse(Guid OrderId, string Carrier);
+
+public static class WriteAggregateViaAsParametersEndpoint
+{
+    [WolverinePost("/orders/asparameters/{orderId}/ship")]
+    public static OrderShipmentResponse Post(
+        [Microsoft.AspNetCore.Http.AsParameters] ShipOrderViaAsParameters command,
+        [WriteAggregate] IEventStream<Order> stream)
+    {
+        stream.AppendOne(new OrderShipped());
+        return new OrderShipmentResponse(command.OrderId, command.Body.Carrier);
+    }
 }
 
 #region sample_write_aggregate_from_method

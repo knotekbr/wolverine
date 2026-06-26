@@ -6,6 +6,7 @@ using JasperFx.Events.Projections;
 using JasperFx.Events.Subscriptions;
 using Polecat;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Wolverine.Polecat.Distribution;
 using Wolverine.Polecat.Publishing;
@@ -71,8 +72,13 @@ public static class WolverineOptionsPolecatExtensions
             var runtime = s.GetRequiredService<IWolverineRuntime>();
             var logger = s.GetRequiredService<ILogger<SqlServerMessageStore>>();
 
+            // Mirror Wolverine.Marten: when no message-storage schema is configured, inherit the
+            // Polecat store's DatabaseSchemaName so distinct-schema Polecat services are isolated by
+            // default (separate durability tables: dead letters, nodes/assignments, …) instead of
+            // all sharing the "wolverine" schema. See GH-3175.
             var schemaName = integration.MessageStorageSchemaName ??
                              runtime.Options.Durability.MessageStorageSchemaName ??
+                             store.Options.DatabaseSchemaName ??
                              "wolverine";
 
             return BuildSqlServerMessageStore(schemaName, store, runtime, logger);
@@ -81,6 +87,14 @@ public static class WolverineOptionsPolecatExtensions
         expression.Services.AddSingleton<IConfigurePolecat, PolecatOverrides>();
 
         expression.Services.AddSingleton<OutboxedSessionFactory>();
+
+        // GH-3109: lets the provider-agnostic [Storage(typeof(IMyStore))] attribute route a handler to
+        // a Polecat ancillary store by resolving this provider from the store marker type. Registered
+        // here (not in PolecatIntegration.Configure) so the singleton is present in the codegen-time
+        // container that StorageAttribute.Modify queries. TryAddEnumerable keeps it to one instance
+        // even when multiple Polecat stores integrate.
+        expression.Services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<Wolverine.Persistence.IAncillaryStoreFrameProvider, PolecatAncillaryStoreFrameProvider>());
 
         // CritterWatch / saga-explorer diagnostic surface — Polecat
         // builds a SqlServerMessageStore underneath, so the lightweight
@@ -92,11 +106,23 @@ public static class WolverineOptionsPolecatExtensions
                 s.GetRequiredService<IWolverineRuntime>(),
                 (IMessageDatabase)s.GetRequiredService<IMessageStore>()));
 
+        // GH-3133 / GH-3219, Gap 2: Polecat's AddPolecat registers IDocumentStore but not the
+        // store-agnostic JasperFx.Events.IEventStore (the Polecat DocumentStore implements
+        // IEventStore<IDocumentSession, IQuerySession>). Bridge it UNCONDITIONALLY so the store is
+        // discoverable via GetServices<IEventStore>() regardless of whether managed distribution is
+        // enabled — the EventSubscriptionAgentFamily resolves stores this way (when managed distribution
+        // is on) AND so does the read-only capabilities / CritterWatch projection-explorer surface
+        // (always). Marten registers IEventStore unconditionally in its own AddMarten.
+        expression.Services.AddSingleton<IEventStore>(s => (IEventStore)s.GetRequiredService<IDocumentStore>());
+
         if (integration.UseWolverineManagedEventSubscriptionDistribution)
         {
             expression.Services.AddSingleton<WolverineProjectionCoordinator>();
             expression.Services.AddSingleton<EventSubscriptionAgentFamily>();
             expression.Services.AddSingleton<IAgentFamily>(s => s.GetRequiredService<EventSubscriptionAgentFamily>());
+            // GH-3133, Gap 1: mirror Marten so tooling resolving GetServices<IEventSubscriptionAgentFamily>()
+            // can map a shard identity to an agent URI for Polecat too.
+            expression.Services.AddSingleton<IEventSubscriptionAgentFamily>(s => s.GetRequiredService<EventSubscriptionAgentFamily>());
             expression.Services.AddSingleton<IProjectionCoordinator, WolverineProjectionCoordinator>();
         }
 

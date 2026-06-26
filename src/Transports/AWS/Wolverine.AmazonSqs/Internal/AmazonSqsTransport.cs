@@ -36,7 +36,35 @@ public class AmazonSqsTransport : BrokerTransport<AmazonSqsQueue>
 
     }
 
-    public override Uri ResourceUri => new Uri(Config.ServiceURL);
+    public override Uri ResourceUri
+    {
+        get
+        {
+            // An explicitly set ServiceURL (e.g. LocalStack) wins
+            if (Config.ServiceURL.IsNotEmpty())
+            {
+                return new Uri(Config.ServiceURL);
+            }
+
+            // Otherwise fall back to the configured region so that this purely
+            // diagnostic Uri doesn't throw when only RegionEndpoint was set
+            try
+            {
+                var region = Config.RegionEndpoint?.SystemName;
+                if (region.IsNotEmpty())
+                {
+                    return new Uri($"https://sqs.{region}.amazonaws.com");
+                }
+            }
+            catch (Exception)
+            {
+                // RegionEndpoint resolution can probe ambient configuration; ignore and
+                // use the generic fallback below
+            }
+
+            return new Uri("sqs://amazon");
+        }
+    }
 
     internal AmazonSqsTransport(IAmazonSQS client) : this()
     {
@@ -138,8 +166,17 @@ public class AmazonSqsTransport : BrokerTransport<AmazonSqsQueue>
         // and SQS queue names are case-sensitive. Without this, the sender creates
         // "wolverine-response-MyApp-123" but the receiver resolves the reply URI
         // to "wolverine-response-myapp-123" (lowercased by Uri), creating a different queue.
+        // The per-node response queue must be unique to this running node. In Solo mode the assigned
+        // node number is always 1 (#3188), and the service name is not unique per host, so multiple
+        // Solo hosts (e.g. the request/reply compliance sender + receiver, or successive fixtures on
+        // one broker) would share one response queue and cross-deliver each other's replies. Use the
+        // always-unique UniqueNodeId in Solo; Balanced gets a unique AssignedNodeNumber via election.
+        // See #3189.
+        var responseNode = runtime.Options.Durability.Mode == DurabilityMode.Solo
+            ? runtime.Options.UniqueNodeId.ToString("N")
+            : runtime.DurabilitySettings.AssignedNodeNumber.ToString();
         var responseName = SanitizeSqsName(
-            $"wolverine.response.{runtime.Options.ServiceName}.{runtime.DurabilitySettings.AssignedNodeNumber}")
+            $"wolverine.response.{runtime.Options.ServiceName}.{responseNode}")
             .ToLowerInvariant();
 
         var queue = Queues[responseName];

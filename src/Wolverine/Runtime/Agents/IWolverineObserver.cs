@@ -1,3 +1,4 @@
+using JasperFx.Events;
 using Wolverine.Configuration;
 using Wolverine.ErrorHandling;
 using Wolverine.Logging;
@@ -46,6 +47,21 @@ public interface IWolverineObserver
     /// Latched: only fires once per unique (incomingType, outgoingType) pair.
     /// </summary>
     void MessageCausedBy(string incomingMessageType, string outgoingMessageType, string handlerType, string? endpointUri)
+    {
+        // Default no-op implementation
+    }
+
+    /// <summary>
+    /// Called when events are appended to an event store during a message/endpoint execution
+    /// enrolled in a Wolverine outbox. The store-specific integration (Wolverine.Marten /
+    /// Wolverine.Polecat) reads the pending/committed events and reports them here so a custom
+    /// observer (e.g. CritterWatch) can attribute each appended event to the executing handler /
+    /// endpoint — a relationship that <see cref="MessageCausedBy"/> can't see, because appended
+    /// events go to the event store, never to the message outbox. Only fired when
+    /// <c>WolverineOptions.Tracking.EnableEventAppendTracking</c> is enabled. Default no-op so
+    /// existing observers are unaffected.
+    /// </summary>
+    void EventsAppended(IReadOnlyList<IEvent> events)
     {
         // Default no-op implementation
     }
@@ -114,12 +130,27 @@ internal class PersistenceWolverineObserver : IWolverineObserver
 
     public async Task NodeStarted()
     {
-        await _runtime.Storage.Nodes.LogRecordsAsync(NodeRecord.For(_runtime.Options, NodeRecordType.NodeStarted));
+        try
+        {
+            await _runtime.Storage.Nodes.LogRecordsAsync(NodeRecord.For(_runtime.Options, NodeRecordType.NodeStarted));
+        }
+        catch (NotSupportedException)
+        {
+            // NullMessageStore does not support node persistence; a storeless Solo node still
+            // fires this bookend (via SoloHeartbeatService) but has nowhere to log it. See #3188.
+        }
     }
 
     public async Task NodeStopped()
     {
-        await _runtime.Storage.Nodes.LogRecordsAsync(NodeRecord.For(_runtime.Options, NodeRecordType.NodeStopped));
+        try
+        {
+            await _runtime.Storage.Nodes.LogRecordsAsync(NodeRecord.For(_runtime.Options, NodeRecordType.NodeStopped));
+        }
+        catch (NotSupportedException)
+        {
+            // NullMessageStore does not support node persistence; nothing to log.
+        }
     }
 
     public async Task AgentStarted(Uri agentUri)

@@ -53,6 +53,32 @@ partial class Build
             WaitForAzureServiceBusEmulatorToBeReady();
         if (services.Contains("kafka"))
             WaitForKafkaToBeReady();
+        if (services.Contains("gcp-pubsub"))
+            WaitForPubsubEmulatorToBeReady();
+    }
+
+    void WaitForPubsubEmulatorToBeReady()
+    {
+        var attempt = 0;
+        while (attempt < 30)
+        {
+            try
+            {
+                using var tcpClient = new System.Net.Sockets.TcpClient();
+                tcpClient.Connect("localhost", 8085);
+                Log.Information("GCP Pub/Sub emulator is up and ready!");
+                return;
+            }
+            catch (Exception)
+            {
+                // ignore connection errors
+            }
+
+            Thread.Sleep(2000);
+            attempt++;
+        }
+
+        Log.Warning("GCP Pub/Sub emulator did not become ready after 60 seconds");
     }
 
     void WaitForKafkaToBeReady()
@@ -240,8 +266,8 @@ partial class Build
             BuildTestProjectsWithFramework("net9.0", persistenceTests);
             StartDockerServices("postgresql", "sqlserver", "rabbitmq");
 
-            RunSingleProjectOneClassAtATime(persistenceTests, frameworkOverride: "net9.0");
-            RunSingleProjectOneClassAtATime(postgresqlTests);
+            RunTestProject(persistenceTests, frameworkOverride: "net9.0");
+            RunTestProject(postgresqlTests);
         });
 
     Target CISqlite => _ => _
@@ -252,7 +278,7 @@ partial class Build
 
             BuildTestProjects(sqliteTests);
 
-            RunSingleProjectOneClassAtATime(sqliteTests);
+            RunTestProject(sqliteTests);
         });
 
     Target CISqlServer => _ => _
@@ -264,7 +290,7 @@ partial class Build
             BuildTestProjects(sqlServerTests);
             StartDockerServices("sqlserver");
 
-            RunSingleProjectOneClassAtATime(sqlServerTests);
+            RunTestProject(sqlServerTests);
         });
 
     Target CIMarten => _ => _
@@ -277,15 +303,7 @@ partial class Build
             BuildTestProjects(martenTests, martenSubscriptionTests);
             StartDockerServices("postgresql");
 
-            // #2810: run each project in a single invocation rather than one
-            // dotnet-test spawn per test class. MartenTests has 111 test files;
-            // the per-class spawn overhead (process start + assembly load +
-            // xUnit discovery + per-fixture Postgres/daemon warm-up) dominated
-            // the ~22 min wall clock. Execution stays serial via the project's
-            // CollectionPerAssembly attribute, so isolation between classes is
-            // unchanged at the concurrency level — see RunWholeProjectWithRetry.
-            RunWholeProjectWithRetry(martenTests);
-            RunWholeProjectWithRetry(martenSubscriptionTests);
+            RunTestProjects([martenTests, martenSubscriptionTests]);
         });
 
     Target CIMySql => _ => _
@@ -297,7 +315,7 @@ partial class Build
             BuildTestProjects(mySqlTests);
             StartDockerServices("mysql");
 
-            RunSingleProjectOneClassAtATime(mySqlTests);
+            RunTestProject(mySqlTests);
         });
 
     Target CIOracle => _ => _
@@ -309,7 +327,7 @@ partial class Build
             BuildTestProjects(oracleTests);
             StartDockerServices("oracle");
 
-            RunSingleProjectOneClassAtATime(oracleTests);
+            RunTestProject(oracleTests);
         });
 
     Target CIEfCore => _ => _
@@ -325,8 +343,7 @@ partial class Build
             // See GH-2588.
             StartDockerServices("postgresql", "sqlserver", "rabbitmq");
 
-            RunSingleProjectOneClassAtATime(efCoreTests);
-            RunSingleProjectOneClassAtATime(efCoreMultiTenancy);
+            RunTestProjects([efCoreTests, efCoreMultiTenancy]);
         });
 
     // ─── Transport CI Targets ──────────────────────────────────────────
@@ -341,8 +358,7 @@ partial class Build
             BuildTestProjects(sqsTests, snsTests);
             StartDockerServices("localstack", "postgresql");
 
-            RunSingleProjectOneClassAtATime(sqsTests);
-            RunSingleProjectOneClassAtATime(snsTests);
+            RunTestProjects([sqsTests, snsTests]);
         });
 
     Target CIKafka => _ => _
@@ -354,7 +370,7 @@ partial class Build
             BuildTestProjects(tests);
             StartDockerServices("kafka", "postgresql");
 
-            RunSingleProjectOneClassAtATime(tests);
+            RunTestProject(tests);
         });
 
     Target CIMQTT => _ => _
@@ -366,7 +382,7 @@ partial class Build
             BuildTestProjects(tests);
             StartDockerServices("postgresql", "sqlserver");
 
-            RunSingleProjectOneClassAtATime(tests);
+            RunTestProject(tests);
         });
 
     Target CINATS => _ => _
@@ -378,7 +394,21 @@ partial class Build
             BuildTestProjects(tests);
             StartDockerServices("postgresql");
 
-            RunSingleProjectOneClassAtATime(tests);
+            RunTestProject(tests);
+        });
+
+    Target CIPubsub => _ => _
+        .ProceedAfterFailure()
+        .Executes(() =>
+        {
+            var tests = RootDirectory / "src" / "Transports" / "GCP" / "Wolverine.Pubsub.Tests" / "Wolverine.Pubsub.Tests.csproj";
+
+            BuildTestProjects(tests);
+            // Durable compliance fixtures persist through Marten/Postgres; the rest use the
+            // Pub/Sub emulator started via docker compose. See #3191.
+            StartDockerServices("gcp-pubsub", "postgresql");
+
+            RunTestProject(tests);
         });
 
     Target CIPulsar => _ => _
@@ -389,7 +419,7 @@ partial class Build
 
             BuildTestProjects(tests);
 
-            RunSingleProjectOneClassAtATime(tests);
+            RunTestProject(tests);
         });
 
     Target CIRedis => _ => _
@@ -401,7 +431,7 @@ partial class Build
             BuildTestProjects(tests);
             StartDockerServices("postgresql");
 
-            RunSingleProjectOneClassAtATime(tests);
+            RunTestProject(tests);
         });
 
     Target CIHttp => _ => _
@@ -425,13 +455,23 @@ partial class Build
         .Executes(() =>
         {
             var rabbitTests = RootDirectory / "src" / "Transports" / "RabbitMQ" / "Wolverine.RabbitMQ.Tests" / "Wolverine.RabbitMQ.Tests.csproj";
-            var circuitTests = RootDirectory / "src" / "Transports" / "RabbitMQ" / "CircuitBreakingTests" / "CircuitBreakingTests.csproj";
 
-            BuildTestProjects(rabbitTests, circuitTests);
+            BuildTestProjects(rabbitTests);
             StartDockerServices("rabbitmq", "postgresql", "sqlserver");
 
-            RunSingleProjectOneClassAtATime(rabbitTests);
-            RunSingleProjectOneClassAtATime(circuitTests);
+            RunTestProject(rabbitTests);
+        });
+
+    Target CICircuitBreaking => _ => _
+        .ProceedAfterFailure()
+        .Executes(() =>
+        {
+            var circuitTests = RootDirectory / "src" / "Transports" / "RabbitMQ" / "CircuitBreakingTests" / "CircuitBreakingTests.csproj";
+
+            BuildTestProjects(circuitTests);
+            StartDockerServices("rabbitmq", "postgresql");
+
+            RunTestProject(circuitTests);
         });
 
     /// <summary>
@@ -452,7 +492,7 @@ partial class Build
             BuildTestProjects(tests);
             StartDockerServices("rabbitmq");
 
-            RunSingleProjectOneClassAtATime(tests);
+            RunTestProject(tests);
         });
 
     Target CICosmosDb => _ => _
@@ -464,8 +504,7 @@ partial class Build
 
             BuildTestProjects(cosmosDbTests, leaderElectionTests);
 
-            RunSingleProjectOneClassAtATime(cosmosDbTests);
-            RunSingleProjectOneClassAtATime(leaderElectionTests);
+            RunTestProjects([cosmosDbTests, leaderElectionTests]);
         });
 
     Target CIRavenDb => _ => _
@@ -477,8 +516,7 @@ partial class Build
 
             BuildTestProjectsWithFramework("net9.0", ravenDbTests, leaderElectionTests);
 
-            RunSingleProjectOneClassAtATime(ravenDbTests, frameworkOverride: "net9.0");
-            RunSingleProjectOneClassAtATime(leaderElectionTests, frameworkOverride: "net9.0");
+            RunTestProjects([ravenDbTests, leaderElectionTests], frameworkOverride: "net9.0");
         });
 
     Target CIGrpc => _ => _
@@ -489,7 +527,7 @@ partial class Build
 
             BuildTestProjects(tests);
 
-            RunSingleProjectOneClassAtATime(tests);
+            RunTestProject(tests);
         });
 
     // ─── AOT Smoke ──────────────────────────────────────────────────────
@@ -533,9 +571,10 @@ partial class Build
             var tests = RootDirectory / "src" / "Transports" / "Azure" / "Wolverine.AzureServiceBus.Tests" / "Wolverine.AzureServiceBus.Tests.csproj";
 
             BuildTestProjects(tests);
-            StartDockerServices("asb-emulator");
+            // Postgres is needed for leader election tests
+            StartDockerServices("asb-emulator", "postgresql");
 
-            RunSingleProjectOneClassAtATime(tests);
+            RunTestProject(tests);
         });
 
     Target CIPolecat => _ => _
@@ -547,6 +586,6 @@ partial class Build
             BuildTestProjectsWithFramework("net10.0", polecatTests);
             StartDockerServices("sqlserver");
 
-            RunSingleProjectOneClassAtATime(polecatTests, frameworkOverride: "net10.0");
+            RunTestProject(polecatTests, frameworkOverride: "net10.0");
         });
 }

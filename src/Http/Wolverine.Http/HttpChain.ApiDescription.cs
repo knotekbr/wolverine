@@ -207,6 +207,27 @@ public partial class HttpChain
 
     public override bool TryFindVariable(string valueName, ValueSource source, Type valueType, out Variable variable)
     {
+        // When the endpoint binds a parameter object via [AsParameters], a value that lives on that
+        // object must be read off it rather than via the route/query read frames that
+        // AsParametersBindingFrame owns and generates inline. Resolving to one of those owned frames
+        // (e.g. Marten's [ReadAggregate]/[WriteAggregate] aggregate-id resolution, which searches with
+        // ValueSource.Anything) makes the frame get pulled into the method's frame chain a second time,
+        // producing a cyclic Next reference and a StackOverflow during code generation. Scoped to
+        // ValueSource.Anything so specific-source bindings are unaffected.
+        if (source == ValueSource.Anything && AsParametersVariable != null && AsParametersType != null)
+        {
+            var asParameterMember = (MemberInfo?)AsParametersType.GetProperties()
+                    .FirstOrDefault(x => x.Name.EqualsIgnoreCase(valueName) && x.PropertyType == valueType && x.CanRead)
+                ?? AsParametersType.GetFields()
+                    .FirstOrDefault(x => x.Name.EqualsIgnoreCase(valueName) && x.FieldType == valueType);
+
+            if (asParameterMember != null)
+            {
+                variable = new MemberAccessVariable(AsParametersVariable, asParameterMember);
+                return true;
+            }
+        }
+
         if ((source == ValueSource.RouteValue || source == ValueSource.Anything) && FindRouteVariable(valueType, valueName, out variable!))
         {
             return true;
@@ -358,7 +379,8 @@ public partial class HttpChain
                 ModelMetadata = new EndpointModelMetadata(RequestType),
                 Source = BindingSource.Body,
                 Type = RequestType,
-                IsRequired = true
+                // A nullable [FromBody] member inside an [AsParameters] type is an optional body. See GH-3135.
+                IsRequired = !RequestBodyIsOptional
             };
 
             apiDescription.ParameterDescriptions.Add(parameterDescription);
@@ -426,9 +448,17 @@ public partial class HttpChain
 
     private ApiParameterDescription buildParameterDescription(RoutePatternParameterPart routeParameter)
     {
-        var variable = _routeVariables.FirstOrDefault(x => x.Usage == routeParameter.Name);
+        // Match the bound route variable case-insensitively: route tokens are conventionally
+        // lower-cased (e.g. {journeyId}) while the bound member/argument is PascalCased
+        // (JourneyId). A case-sensitive match here silently misses and falls back to string,
+        // losing the real type (e.g. Guid/int) on the generated OpenAPI parameter. See GH-3135.
+        var variable = _routeVariables.FirstOrDefault(x => x.Usage.EqualsIgnoreCase(routeParameter.Name));
 
-        var parameterType = variable?.VariableType ?? typeof(string);
+        // When no typed argument is bound to the route value (e.g. a plain complex-body endpoint
+        // whose body property overlaps a route token, or an aggregate-id route), fall back to the
+        // route constraint (`{id:guid}`, `{n:int}`, ...) so the parameter still gets its real
+        // type/format instead of defaulting to string. Both OpenAPI stacks schematize from .Type.
+        var parameterType = variable?.VariableType ?? TypeFromRouteConstraint(routeParameter) ?? typeof(string);
         var parameter = new ApiParameterDescription
         {
             Name = routeParameter.Name,
@@ -444,6 +474,49 @@ public partial class HttpChain
             }
         };
         return parameter;
+    }
+
+    // Maps an inline route constraint to the CLR type ASP.NET's own route binding would use, so the
+    // generated OpenAPI parameter carries the right schema type/format (e.g. {id:guid} -> uuid,
+    // {n:int} -> integer). Returns null for `string`/unconstrained or constraints that don't imply a
+    // type (length/regex/min/max/etc.), letting the caller default to string. See GH-3135.
+    private static Type? TypeFromRouteConstraint(RoutePatternParameterPart routeParameter)
+    {
+        foreach (var policy in routeParameter.ParameterPolicies)
+        {
+            var content = policy.Content;
+            if (content.IsEmpty())
+            {
+                continue;
+            }
+
+            // Constraints can be parameterized (e.g. "length(5)", "regex(...)"); only the leading
+            // constraint name carries the type signal.
+            var parenIndex = content.IndexOf('(');
+            var name = parenIndex > 0 ? content[..parenIndex] : content;
+
+            switch (name.ToLowerInvariant())
+            {
+                case "int":
+                    return typeof(int);
+                case "long":
+                    return typeof(long);
+                case "bool":
+                    return typeof(bool);
+                case "datetime":
+                    return typeof(DateTime);
+                case "decimal":
+                    return typeof(decimal);
+                case "double":
+                    return typeof(double);
+                case "float":
+                    return typeof(float);
+                case "guid":
+                    return typeof(Guid);
+            }
+        }
+
+        return null;
     }
 }
 

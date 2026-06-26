@@ -227,7 +227,8 @@ const config: UserConfig<DefaultTheme.Config> = {
                                         {text: 'Listening', link:'/guide/messaging/transports/gcp-pubsub/listening'},
                                         {text: 'Dead Letter Queues', link:'/guide/messaging/transports/gcp-pubsub/deadlettering'},
                                         {text: 'Conventional Routing', link:'/guide/messaging/transports/gcp-pubsub/conventional-routing'},
-                                        {text: 'Interoperability', link:'/guide/messaging/transports/gcp-pubsub/interoperability'}
+                                        {text: 'Interoperability', link:'/guide/messaging/transports/gcp-pubsub/interoperability'},
+                                        {text: 'Customisation', link:'/guide/messaging/transports/gcp-pubsub/customisation'}
                                     ]},
                                 {text: 'Apache Pulsar', link: '/guide/messaging/transports/pulsar'},
                                 {text: 'Sql Server', link: '/guide/messaging/transports/sqlserver'},
@@ -333,6 +334,7 @@ const config: UserConfig<DefaultTheme.Config> = {
                                 {text: 'Subscription/Projection Distribution', link: '/guide/durability/polecat/distribution'},
                                 {text: 'Sagas', link: '/guide/durability/polecat/sagas'},
                                 {text: 'Multi-Tenancy and Polecat', link: '/guide/durability/polecat/multi-tenancy'},
+                                {text: 'Ancillary Polecat Stores', link: '/guide/durability/polecat/ancillary-stores'},
                             ]},
                         {text: 'Sql Server Integration', link: '/guide/durability/sqlserver'},
                         {text: 'PostgreSQL Integration', link: '/guide/durability/postgresql'},

@@ -2,6 +2,7 @@ using ImTools;
 using JasperFx.Core;
 using JasperFx.Core.Reflection;
 using JasperFx.Descriptors;
+using Microsoft.Extensions.Logging;
 using Wolverine.Persistence.Durability;
 using Wolverine.Persistence.Durability.DeadLetterManagement;
 using Wolverine.Runtime;
@@ -116,6 +117,23 @@ public class MessageStoreCollection : IAgentFamily, IAsyncDisposable
 
         var mains = _services.Enumerate().Select(x => x.Value)
             .Where(x => x.Role == MessageStoreRole.Main).ToArray();
+
+        // GH-3226: opt-in reconciliation for >1 Main store (e.g. an event-store-integrated main plus a
+        // database-backed transport that also claims Main). The policy designates the store to keep as
+        // Main and we demote the rest to Ancillary, rather than throwing.
+        if (mains.Length > 1 && _runtime.Options.Durability.ResolveMainStoreOnConflict is { } resolveMain)
+        {
+            var chosen = resolveMain(mains);
+            if (chosen != null && mains.Contains(chosen))
+            {
+                foreach (var demoted in mains.Where(x => !ReferenceEquals(x, chosen)))
+                {
+                    demoted.DemoteToAncillary();
+                }
+
+                mains = [chosen];
+            }
+        }
 
         if (mains.Length > 1)
         {
@@ -319,9 +337,25 @@ public class MessageStoreCollection : IAgentFamily, IAsyncDisposable
 
     public async Task ReleaseAllOwnershipAsync(int nodeNumber)
     {
-        foreach (var store in  _services.Enumerate().Select(x => x.Value))
+        // Best-effort, per store. This runs during teardown — including after a FAILED or partial
+        // startup, where an ancillary store's schema (e.g. wolverine_incoming_envelopes) may never
+        // have been created and the release UPDATE throws (PostgreSQL 42P01, etc.). Releasing
+        // ownership is itself optional: any envelopes left as owner_id = nodeNumber are reclaimed by
+        // the durability agent's recovery polling on the next live node. So a single failing store
+        // must not abort releasing the others, nor surface as an unhandled teardown error that masks
+        // the real startup failure. See GH-3123.
+        foreach (var store in _services.Enumerate().Select(x => x.Value))
         {
-            await store.Admin.ReleaseAllOwnershipAsync(nodeNumber);
+            try
+            {
+                await store.Admin.ReleaseAllOwnershipAsync(nodeNumber);
+            }
+            catch (Exception e)
+            {
+                _runtime.Logger.LogDebug(e,
+                    "Error while releasing node ownership for message store {Store} during teardown. This is safe to ignore; ownership is reclaimed by recovery polling.",
+                    store.Name);
+            }
         }
     }
 

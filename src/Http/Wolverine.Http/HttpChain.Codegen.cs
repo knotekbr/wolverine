@@ -135,7 +135,18 @@ public partial class HttpChain
         
         if (AuditedMembers.Count != 0)
         {
-            Middleware.Insert(0, new AuditToActivityFrame(this));
+            // When the endpoint binds via [AsParameters], an audited member (e.g. an inferred aggregate
+            // id) lives on the container type, not on InputType() — which a [FromBody] member may have
+            // overwritten to the body type. Resolve the audit variable from the container in that case
+            // so the member access is valid and the codegen doesn't fail to resolve a body-typed
+            // variable that has no standalone binding. See GH-3135.
+            Type? auditInputType = null;
+            if (AsParametersType != null && AuditedMembers.All(x => x.Member.DeclaringType == AsParametersType))
+            {
+                auditInputType = AsParametersType;
+            }
+
+            Middleware.Insert(0, new AuditToActivityFrame(this, auditInputType));
         }
 
         var index = 0;
@@ -183,6 +194,17 @@ public partial class HttpChain
             Postprocessors.Add(flush);
         }
         
+        // CritterWatch #396 Phase 4 item 5: attribute endpoint-originated publishes to the route+verb.
+        // HTTP endpoints aren't MessageHandler subclasses, so MessageHandler.RecordCauseAndEffect never
+        // runs for them; this emits the parallel EndpointCausation call between the method/return-value
+        // frames (which enqueue cascading messages) and the postprocessor flush. Codegen-only gating,
+        // mirroring HandlerChain — off ⇒ no frame, no runtime cost.
+        if (_parent.Options.Tracking.EnableMessageCausationTracking)
+        {
+            var origin = $"{_httpMethods.Select(x => x.ToUpper()).Join("/")} {RoutePattern!.RawText}";
+            yield return new RecordEndpointCausationFrame(origin, Method.HandlerType.FullNameInCode());
+        }
+
         foreach (var frame in Postprocessors) yield return frame;
     }
 

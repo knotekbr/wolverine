@@ -2,6 +2,7 @@ using Confluent.Kafka;
 using JasperFx.Core;
 using JasperFx.Descriptors;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Wolverine.Configuration;
 using Wolverine.Runtime;
 using Wolverine.Runtime.Routing;
@@ -61,6 +62,12 @@ public class KafkaTransport : BrokerTransport<KafkaTopic>
     public string DeadLetterQueueTopicName { get; set; } = DeadLetterQueueConstants.DefaultQueueName;
 
     public KafkaUsage Usage { get; set; } = KafkaUsage.ProduceAndConsume;
+
+    /// <summary>
+    /// True when static group membership was requested at the transport level (GH-3139). Used to emit a
+    /// startup diagnostic about the resolved group.instance.id.
+    /// </summary>
+    internal bool StaticMembershipRequested { get; set; }
 
     public override Uri ResourceUri
     {
@@ -132,7 +139,108 @@ public class KafkaTransport : BrokerTransport<KafkaTopic>
             dlqTopic.Compile(runtime);
         }
 
+        warnOnStaticMembership(runtime);
+        registerRetryTopicListeners(runtime);
+
         return ValueTask.CompletedTask;
+    }
+
+    // GH-3148: discover the non-blocking retry-topic policy (MoveToKafkaRetryTopic) in the global failure
+    // rules and auto-register a delayed listener per source topic × tier, plus a startup validation warning
+    // if the policy could apply to non-Kafka endpoints (where it degrades to an inline retry).
+    private void registerRetryTopicListeners(IWolverineRuntime runtime)
+    {
+        var delays = new HashSet<TimeSpan>();
+        foreach (var rule in runtime.Options.HandlerGraph.Failures)
+        {
+            if (rule.InfiniteSource is MoveToKafkaRetryTopicContinuation continuation)
+            {
+                foreach (var delay in continuation.Delays)
+                {
+                    delays.Add(delay);
+                }
+            }
+        }
+
+        if (delays.Count == 0)
+        {
+            return;
+        }
+
+        var logger = runtime.LoggerFactory.CreateLogger<KafkaTransport>();
+
+        // Validation: this policy only routes Kafka messages (the continuation self-guards), so warn if
+        // any non-Kafka listener exists where it will silently degrade to an inline retry.
+        var hasNonKafkaListener = runtime.Options.Transports
+            .Where(t => t is not KafkaTransport)
+            .SelectMany(t => t.Endpoints())
+            .Any(e => e.IsListener);
+        if (hasNonKafkaListener)
+        {
+            logger.LogWarning(
+                "MoveToKafkaRetryTopic is configured but non-Kafka listeners are present. The Kafka retry topics only apply to messages received over Kafka; failures on other transports will fall back to an inline retry.");
+        }
+
+        // Source application listener topics (exclude the DLQ, system, and existing retry-tier topics).
+        var sources = Topics
+            .Where(t => t.IsListener && t.RetryTierDelay == null && t.TopicName != DeadLetterQueueTopicName
+                        && t.TopicName != KafkaTopic.WolverineTopicsName && !t.TopicName.Contains(".retry."))
+            .Select(t => t.TopicName)
+            .ToList();
+
+        foreach (var source in sources)
+        {
+            foreach (var delay in delays)
+            {
+                var tierTopic = Topics[KafkaRetryNaming.RetryTopicName(source, delay)];
+                tierTopic.IsListener = true;
+                tierTopic.RetryTierDelay = delay;
+                tierTopic.Mode = EndpointMode.Inline;
+                // Stable group + earliest so a tier consumer never misses a just-produced retry record
+                // (a Latest consumer races the producer). Reads + commits its own retry-topic offsets.
+                tierTopic.ConsumerConfig = new ConsumerConfig
+                {
+                    GroupId = $"{runtime.Options.ServiceName}-retry",
+                    AutoOffsetReset = AutoOffsetReset.Earliest
+                };
+                tierTopic.Compile(runtime);
+
+                logger.LogInformation("Registered Kafka retry-tier listener {Topic} (delay {Delay})",
+                    tierTopic.TopicName, delay);
+            }
+        }
+    }
+
+    // GH-3139: surface the resolved group.instance.id so operators can verify per-node uniqueness, and
+    // warn loudly if static membership was requested but no stable id could be resolved.
+    private void warnOnStaticMembership(IWolverineRuntime runtime)
+    {
+        var logger = runtime.LoggerFactory.CreateLogger<KafkaTransport>();
+
+        void Check(bool requested, string? instanceId, string scope)
+        {
+            if (!requested) return;
+
+            if (string.IsNullOrWhiteSpace(instanceId))
+            {
+                logger.LogWarning(
+                    "Kafka static membership was requested ({Scope}) but no stable group.instance.id could be resolved (checked the supplied source, POD_NAME, HOSTNAME, and machine name). Static membership will not take effect and rolling restarts may trigger partition rebalancing. Provide an explicit per-node id via UseStaticMembership(...).",
+                    scope);
+            }
+            else
+            {
+                logger.LogInformation(
+                    "Kafka static membership enabled ({Scope}) with group.instance.id '{InstanceId}'. Ensure this value is unique per node and stable across restarts of the same node.",
+                    scope, instanceId);
+            }
+        }
+
+        Check(StaticMembershipRequested, ConsumerConfig.GroupInstanceId, "transport");
+
+        foreach (var topic in Topics.Where(x => x.StaticMembershipRequested))
+        {
+            Check(true, topic.GetEffectiveConsumerConfig().GroupInstanceId, $"topic '{topic.TopicName}'");
+        }
     }
 
     public WolverineTransportHealthCheck BuildHealthCheck(IWolverineRuntime runtime)

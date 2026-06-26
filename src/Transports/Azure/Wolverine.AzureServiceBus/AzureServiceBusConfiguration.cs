@@ -1,5 +1,6 @@
 using Azure.Messaging.ServiceBus.Administration;
 using JasperFx.Core;
+using Microsoft.Extensions.DependencyInjection;
 using Wolverine.AzureServiceBus.Internal;
 using Wolverine.Configuration;
 using Wolverine.Transports;
@@ -166,6 +167,68 @@ public class AzureServiceBusConfiguration : BrokerExpression<AzureServiceBusTran
     }
 
     /// <summary>
+    /// Enable a background listener that drains the native Azure Service Bus dead letter sub-queues
+    /// (<c>$DeadLetterQueue</c>) of every listening queue and subscription, recovering the messages
+    /// into Wolverine's durable dead letter storage (the <c>wolverine_dead_letters</c> table). This
+    /// makes natively dead-lettered messages queryable and replayable through <c>IDeadLetters</c>
+    /// and tools like CritterWatch. It is the Azure Service Bus analogue of RabbitMQ's
+    /// <c>EnableDeadLetterQueueRecovery()</c>, and reads the native
+    /// <c>DeadLetterReason</c>/<c>DeadLetterErrorDescription</c> as the recorded failure metadata.
+    ///
+    /// Requires Wolverine's durable message storage (a database) to be configured.
+    /// </summary>
+    /// <returns></returns>
+    public AzureServiceBusConfiguration EnableDeadLetterQueueRecovery()
+    {
+        ensureRecoveryServicesRegistered();
+        return this;
+    }
+
+    /// <summary>
+    /// Enable a background listener that drains the native Azure Service Bus dead letter sub-queues
+    /// of only the named queues (or subscription endpoint names), recovering the messages into
+    /// Wolverine's durable dead letter storage.
+    /// </summary>
+    /// <param name="queueOrSubscriptionNames">
+    /// The queue names — or subscription endpoint names — whose native dead letter sub-queues should
+    /// be drained.
+    /// </param>
+    /// <returns></returns>
+    public AzureServiceBusConfiguration EnableDeadLetterQueueRecovery(params string[] queueOrSubscriptionNames)
+    {
+        var settings = ensureRecoveryServicesRegistered();
+        foreach (var name in queueOrSubscriptionNames)
+        {
+            if (!settings.EndpointNames.Contains(name))
+            {
+                settings.EndpointNames.Add(name);
+            }
+        }
+
+        return this;
+    }
+
+    private AzureServiceBusDeadLetterQueueRecoverySettings ensureRecoveryServicesRegistered()
+    {
+        var existing = Options.Services
+            .Where(s => s.ServiceType == typeof(AzureServiceBusDeadLetterQueueRecoverySettings))
+            .Select(s => s.ImplementationInstance)
+            .OfType<AzureServiceBusDeadLetterQueueRecoverySettings>()
+            .FirstOrDefault();
+
+        if (existing != null)
+        {
+            return existing;
+        }
+
+        var settings = new AzureServiceBusDeadLetterQueueRecoverySettings();
+        Options.Services.AddSingleton(settings);
+        Options.Services.AddSingleton(Transport);
+        Options.Services.AddHostedService<AzureServiceBusDeadLetterQueueListener>();
+        return settings;
+    }
+
+    /// <summary>
     /// Is Wolverine enabled to create system queues automatically for responses and retries? This
     /// should probably be set to false if the application does not have permissions to create queues
     /// </summary>
@@ -185,7 +248,12 @@ public class AzureServiceBusConfiguration : BrokerExpression<AzureServiceBusTran
     /// <returns></returns>
     public AzureServiceBusConfiguration EnableWolverineControlQueues()
     {
-        var queueName = "wolverine.control." + Options.Durability.AssignedNodeNumber;
+        // In Solo mode the assigned node number is always 1 (#3188); key the per-node control queue
+        // on the unique node id so multiple Solo hosts on one namespace don't collide. See #3189.
+        var controlNode = Options.Durability.Mode == DurabilityMode.Solo
+            ? Options.UniqueNodeId.ToString("N")
+            : Options.Durability.AssignedNodeNumber.ToString();
+        var queueName = "wolverine.control." + controlNode;
         
         var queue = Transport.Queues[queueName];
 

@@ -63,6 +63,13 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
 
     internal Variable? RequestBodyVariable { get; set; }
 
+    /// <summary>
+    /// True when the request body is optional — i.e. a nullable [FromBody] member inside an
+    /// [AsParameters] type. Drives both the runtime read (an empty body binds null instead of 400)
+    /// and the generated OpenAPI (requestBody.required = false). See GH-3135.
+    /// </summary>
+    internal bool RequestBodyIsOptional { get; set; }
+
     private string? _fileName;
     private readonly List<string> _httpMethods = [];
 
@@ -863,6 +870,17 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
     /// FluentValidation to also validate the AsParameters type itself.
     /// </summary>
     public Type? AsParametersType { get; internal set; }
+
+    /// <summary>
+    /// The codegen variable for the object bound from an <c>[AsParameters]</c> parameter, if any.
+    /// Other middleware that searches for a value with <see cref="ValueSource.Anything"/> (notably the
+    /// Marten <c>[ReadAggregate]</c>/<c>[WriteAggregate]</c> aggregate-id resolution) reads members off
+    /// this object rather than re-using the route/query read frames that <c>AsParametersBindingFrame</c>
+    /// owns and generates inline — sharing those owned frames produces a cyclic Next reference and a
+    /// StackOverflow during code generation.
+    /// </summary>
+    public Variable? AsParametersVariable { get; internal set; }
+
     public ServiceProviderSource ServiceProviderSource { get; set; } = ServiceProviderSource.IsolatedAndScoped;
 
     internal Variable BuildJsonDeserializationVariable()
