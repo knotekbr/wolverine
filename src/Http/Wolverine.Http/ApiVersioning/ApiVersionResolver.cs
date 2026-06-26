@@ -3,7 +3,10 @@ using Asp.Versioning;
 
 namespace Wolverine.Http.ApiVersioning;
 
-internal readonly record struct ApiVersionResolution(ApiVersion Version, bool IsDeprecated);
+internal readonly record struct ApiVersionResolution(ApiVersion Version, ApiVersionProviderOptions Options)
+{
+    public bool IsDeprecated => Options.HasFlag(ApiVersionProviderOptions.Deprecated);
+}
 
 internal static class ApiVersionResolver
 {
@@ -68,7 +71,8 @@ internal static class ApiVersionResolver
             }
 
             // Deprecation flags on the class still apply to the filtered subset.
-            return BuildResolutions(requestedVersions, classApiVersionAttrs);
+            List<IApiVersionProvider> optionsSources = [.. methodMapToAttrs, .. classApiVersionAttrs];
+            return BuildResolutions(requestedVersions, optionsSources);
         }
 
         if (classApiVersionAttrs.Count == 0) return Array.Empty<ApiVersionResolution>();
@@ -78,19 +82,25 @@ internal static class ApiVersionResolver
 
     /// <summary>
     /// Builds resolutions for the given <paramref name="versions"/> in order, marking each as
-    /// deprecated when any attribute in <paramref name="deprecationSource"/> declares the version
+    /// deprecated when any attribute in <paramref name="optionsSources"/> declares the version
     /// with <see cref="ApiVersionAttribute.Deprecated"/>. Used by every branch of
     /// <see cref="ResolveVersions"/>: class-only, method-only, and [MapToApiVersion] filtering.
     /// </summary>
     private static IReadOnlyList<ApiVersionResolution> BuildResolutions(
         IReadOnlyCollection<ApiVersion> versions,
-        IReadOnlyCollection<ApiVersionAttribute> deprecationSource)
+        IReadOnlyCollection<IApiVersionProvider> optionsSources
+    )
     {
         var result = new List<ApiVersionResolution>(versions.Count);
         foreach (var version in versions)
         {
-            var isDeprecated = deprecationSource.Any(a => a.Deprecated && a.Versions.Contains(version));
-            result.Add(new ApiVersionResolution(version, isDeprecated));
+            var options = ApiVersionProviderOptions.None;
+            foreach (var provider in optionsSources)
+            {
+                if (provider.Versions.Contains(version))
+                    options |= provider.Options;
+            }
+            result.Add(new ApiVersionResolution(version, options));
         }
         return result;
     }
