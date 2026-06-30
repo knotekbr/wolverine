@@ -32,6 +32,11 @@ internal sealed class AspVersioningPolicy : IHttpPolicy
 
         foreach (var vc in versionedChains)
         {
+            vc.Chain.RequiresApplicationServices = true;
+
+            if (!vc.Chain.HasExplicitOperationId)
+                vc.Chain.SetExplicitOperationId(vc.Chain.OperationId);
+
             vc.Chain.WithApiVersionSet(versionSet);
 
             if (vc.IsVersionNeutral)
@@ -40,22 +45,13 @@ internal sealed class AspVersioningPolicy : IHttpPolicy
                 continue;
             }
 
-            foreach (var supported in vc.Supported)
-            {
-                if (supported.Options.HasFlag(ApiVersionProviderOptions.Mapped))
-                    vc.Chain.MapToApiVersion(supported.Version);
-                else
-                    vc.Chain.HasApiVersion(supported.Version);
-            }
-
-            foreach (var deprecated in vc.Deprecated)
-                vc.Chain.HasDeprecatedApiVersion(deprecated.Version);
-
-            foreach (var advertised in vc.Advertised)
-                vc.Chain.AdvertisesApiVersion(advertised.Version);
-
-            foreach (var advertisedDeprecated in vc.AdvertisedDeprecated)
-                vc.Chain.AdvertisesDeprecatedApiVersion(advertisedDeprecated.Version);
+            // Map this chain to every version it serves. Supported-vs-deprecated and advertised are
+            // all properties of the shared set built above — MapToApiVersion inherits roles from the
+            // set and (unlike HasApiVersion/HasDeprecatedApiVersion) does not mutate it, so there is
+            // no per-chain role reconciliation. Advertise-only chains serve nothing, emit nothing,
+            // and inherit the set's full space (incl. the advertised fold).
+            foreach (var served in vc.Supported.Concat(vc.Deprecated))
+                vc.Chain.MapToApiVersion(served.Version);
         }
     }
 
@@ -63,11 +59,36 @@ internal sealed class AspVersioningPolicy : IHttpPolicy
     {
         var versionSetBuilder = new ApiVersionSetBuilder(null);
 
-        foreach (var supported in versionedChains.SelectMany(vc => vc.AllSupported))
-            versionSetBuilder.HasApiVersion(supported.Version);
+        var supported = versionedChains.SelectMany(vc => vc.Supported).Select(r => r.Version).ToHashSet();
+        var deprecated = versionedChains.SelectMany(vc => vc.Deprecated).Select(r => r.Version).ToHashSet();
+        var advertised = versionedChains.SelectMany(vc => vc.Advertised).Select(r => r.Version).ToHashSet();
+        var advertisedDeprecated = versionedChains.SelectMany(vc => vc.AdvertisedDeprecated).Select(r => r.Version).ToHashSet();
 
-        foreach (var deprecated in versionedChains.SelectMany(vc => vc.AllDeprecated))
-            versionSetBuilder.HasDeprecatedApiVersion(deprecated.Version);
+        // Supported wins over deprecated for the same version anywhere in the group — applied ONCE,
+        // here. A version supported (served or advertised) by any sibling must not also be reported
+        // deprecated. This matches Asp.Versioning's own ApiVersionModelExtensions.Aggregate
+        // (deprecated.ExceptWith(supported)); the endpoint finalizer never calls Aggregate, and
+        // neither ApiVersionSetBuilder nor the ApiVersionModel ctor de-dups, so the policy must seed
+        // an already-consistent set.
+        var allSupported = new HashSet<ApiVersion>(supported);
+        allSupported.UnionWith(advertised);
+        deprecated.ExceptWith(allSupported);
+        advertisedDeprecated.ExceptWith(allSupported);
+
+        // Seed each version under its role so the set model keeps the advertised lists distinct
+        // (AdvertisedApiVersions / DeprecatedAdvertisedApiVersions) while still folding them into
+        // SupportedApiVersions / DeprecatedApiVersions for the response headers.
+        foreach (var version in supported)
+            versionSetBuilder.HasApiVersion(version);
+
+        foreach (var version in deprecated)
+            versionSetBuilder.HasDeprecatedApiVersion(version);
+
+        foreach (var version in advertised)
+            versionSetBuilder.AdvertisesApiVersion(version);
+
+        foreach (var version in advertisedDeprecated)
+            versionSetBuilder.AdvertisesDeprecatedApiVersion(version);
 
         return versionSetBuilder.Build();
     }

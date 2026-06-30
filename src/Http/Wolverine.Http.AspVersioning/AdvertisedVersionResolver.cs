@@ -6,37 +6,36 @@ namespace Wolverine.Http.AspVersioning;
 
 internal static class AdvertisedVersionResolver
 {
+    /// <summary>
+    /// Resolves all API versions advertised by a handler method.
+    /// </summary>
+    /// <param name="method">The handler method.</param>
+    /// <returns>
+    /// An ordered, distinct list of <see cref="ApiVersionResolution"/>; empty when no advertise
+    /// version attributes are present.
+    /// </returns>
     public static IReadOnlyList<ApiVersionResolution> ResolveAdvertised(MethodInfo method)
     {
-        return getMergedAdvertiseAttributes(method)
+        var mergedAttributes = getMergedAdvertiseAttributes(method)
             .Cast<IApiVersionProvider>()
-            .SelectMany(
-                provider => provider.Versions,
-                (provider, version) => (Version: version, provider.Options)
-            )
-            .Aggregate(
-                new Dictionary<ApiVersion, ApiVersionProviderOptions>(),
-                (dict, tuple) =>
-                {
-                    if (!dict.TryGetValue(tuple.Version, out var options))
-                        options = tuple.Options;
-
-                    dict[tuple.Version] = options | tuple.Options;
-                    return dict;
-                }
-            )
-            .Select(kvp => new ApiVersionResolution(kvp.Key, kvp.Value))
             .ToList();
+        var versions = mergedAttributes.SelectMany(attr => attr.Versions).Distinct().ToList();
+
+        return ApiVersionResolver.BuildResolutions(versions, mergedAttributes);
     }
 
     private static IEnumerable<AdvertiseApiVersionsAttribute> getMergedAdvertiseAttributes(
         MethodInfo method
-    ) =>
-        method
+    )
+    {
+        // Unlike [ApiVersion] and [MapToApiVersion], [AdvertiseApiVersions] is additive across method
+        // and class. We can just merge them without any special logic.
+        return method
             .GetCustomAttributes<AdvertiseApiVersionsAttribute>(inherit: false)
             .Concat(
                 method.DeclaringType?.GetCustomAttributes<AdvertiseApiVersionsAttribute>(
                     inherit: false
                 ) ?? []
             );
+    }
 }

@@ -81,12 +81,16 @@ internal static class ApiVersionResolver
     }
 
     /// <summary>
-    /// Builds resolutions for the given <paramref name="versions"/> in order, marking each as
-    /// deprecated when any attribute in <paramref name="optionsSources"/> declares the version
-    /// with <see cref="ApiVersionAttribute.Deprecated"/>. Used by every branch of
-    /// <see cref="ResolveVersions"/>: class-only, method-only, and [MapToApiVersion] filtering.
+    /// Builds resolutions for the given <paramref name="versions"/> in order. Each resolution
+    /// includes the combined (bitwise sum) <see cref="ApiVersionProviderOptions"/> from all providers
+    /// in <paramref name="optionsSources"/> that declare the version.
     /// </summary>
-    private static IReadOnlyList<ApiVersionResolution> BuildResolutions(
+    /// <param name="versions">The API versions to build resolutions for.</param>
+    /// <param name="optionsSources">
+    /// The API version providers that supply options for the versions.
+    /// </param>
+    /// <returns>A read-only list of API version resolutions.</returns>
+    public static IReadOnlyList<ApiVersionResolution> BuildResolutions(
         IReadOnlyCollection<ApiVersion> versions,
         IReadOnlyCollection<IApiVersionProvider> optionsSources
     )
